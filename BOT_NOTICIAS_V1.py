@@ -14,9 +14,9 @@ from flask import Flask, jsonify
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Intervalos (en minutos) – ajustables por variables de entorno
-MACRO_INTERVAL_MINUTES = int(os.getenv("MACRO_INTERVAL_MINUTES", "60"))   # macro cada 60 min
-NEWS_INTERVAL_MINUTES = int(os.getenv("NEWS_INTERVAL_MINUTES", "30"))     # noticias cada 30 min
+# Intervalos (en minutos)
+MACRO_INTERVAL_MINUTES = int(os.getenv("MACRO_INTERVAL_MINUTES", "60"))
+NEWS_INTERVAL_MINUTES = int(os.getenv("NEWS_INTERVAL_MINUTES", "30"))
 
 # Palabras clave para noticias
 KEYWORDS = [
@@ -161,7 +161,6 @@ def macro_job():
     for ev in events:
         event_id = ev["datetime"].isoformat() + "_" + ev["event"]
         if event_id not in sent:
-            # Enviar alerta solo si es High (evitamos spam)
             if ev["impact"] == "High":
                 msg = (
                     f"📅 *EVENTO MACRO*\n"
@@ -176,7 +175,6 @@ def macro_job():
                 save_json(SENT_MACRO_FILE, sent)
                 time.sleep(1)
 
-        # Construir señal para eventos próximos (menos de 3h)
         minutes_left = (ev["datetime"] - now).total_seconds() / 60
         if minutes_left <= 180 and ev["impact"] == "High":
             signal_macro["has_high_impact"] = True
@@ -234,7 +232,6 @@ def news_job():
     for item in news:
         title_lower = item["title"].lower()
         is_high_impact = any(w in title_lower for w in HIGH_IMPACT_WORDS)
-        # Enviar solo si sentimiento fuerte o palabra de alto impacto
         if abs(item["sentiment"]) > SENTIMENT_THRESHOLD or is_high_impact:
             emoji = "🟢 ALCISTA" if item["sentiment"] > 0 else "🔴 BAJISTA" if item["sentiment"] < 0 else "🔵 NEUTRAL"
             msg = (
@@ -248,7 +245,6 @@ def news_job():
             save_sent_link(item["link"])
             time.sleep(1)
 
-        # Actualizar señal
         signal_news["recent_count"] += 1
         signal_news["latest_sentiment"] = item["sentiment"]
         if "emergency" in title_lower or "attack" in title_lower:
@@ -300,15 +296,52 @@ def get_signal():
 def run_flask():
     app.run(host='0.0.0.0', port=5000)
 
+# ==================== FUNCIÓN DE PRUEBA INICIAL ====================
+def enviar_status_inicial():
+    """Envía un mensaje a Telegram con el estado actual (próximos eventos y noticias recientes)."""
+    logging.info("Generando status inicial...")
+    macro_events = fetch_macro_events()
+    news_items = fetch_news()
+
+    # Construir mensaje
+    lines = []
+    lines.append("🤖 *Bot Fundamental iniciado*")
+    lines.append(f"📅 Macro: revisión cada {MACRO_INTERVAL_MINUTES} min")
+    lines.append(f"📰 Noticias: revisión cada {NEWS_INTERVAL_MINUTES} min")
+    lines.append("")
+
+    if macro_events:
+        lines.append("*Próximos eventos macro:*")
+        for ev in macro_events[:5]:  # mostrar hasta 5
+            lines.append(f"• {ev['event']} ({ev['impact']}) - {ev['datetime'].strftime('%d/%m %H:%M UTC')}")
+        if len(macro_events) > 5:
+            lines.append(f"... y {len(macro_events)-5} más.")
+    else:
+        lines.append("No hay eventos macro relevantes en las próximas 24h.")
+
+    lines.append("")
+    if news_items:
+        lines.append("*Noticias recientes detectadas:*")
+        for n in news_items[:3]:
+            lines.append(f"• {n['title'][:80]}... (sentimiento {n['sentiment']:.2f})")
+        if len(news_items) > 3:
+            lines.append(f"... y {len(news_items)-3} más.")
+    else:
+        lines.append("No se encontraron noticias con palabras clave.")
+
+    send_telegram("\n".join(lines))
+
 # ==================== INICIO ====================
 if __name__ == "__main__":
-    send_telegram("🤖 *Bot Fundamental Unificado con Flask iniciado*")
-    # Iniciar el servidor Flask en un hilo separado
+    # Enviar mensaje de inicio con status actual
+    enviar_status_inicial()
+
+    # Iniciar servidor Flask
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     logging.info("Servidor Flask iniciado en puerto 5000")
 
-    # Programar la actualización de señal cada 30 minutos (o el intervalo que prefieras)
+    # Programar tareas
     scheduler = BackgroundScheduler()
     scheduler.add_job(update_signal, 'interval', minutes=30)
     scheduler.start()
