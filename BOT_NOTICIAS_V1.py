@@ -11,6 +11,7 @@ from bs4 import BeautifulSoup
 from flask import Flask, jsonify
 from deep_translator import GoogleTranslator
 from collections import Counter
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # ==================== CONFIGURACIÓN ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -27,21 +28,26 @@ KEYWORDS = [
     "fomc", "powell", "emergencia", "interest rates", "rate hike"
 ]
 
-# Fuentes RSS (noticias en inglés)
-RSS_FEEDS = [
-    "https://www.reuters.com/rss/topNews",
-    "https://www.coindesk.com/arc/outboundfeeds/rss/",
-    "https://news.google.com/rss?q=bitcoin+OR+btc+OR+federal+reserve+OR+sec&hl=en-US&gl=US&ceid=US:en"
-]
+# Fuentes RSS con pesos (dominio -> peso)
+RSS_FEEDS = {
+    "https://www.reuters.com/rss/topNews": 1.5,
+    "https://www.coindesk.com/arc/outboundfeeds/rss/": 1.2,
+    "https://news.google.com/rss?q=bitcoin+OR+btc+OR+federal+reserve+OR+sec&hl=en-US&gl=US&ceid=US:en": 0.8
+}
 
 # Archivos
 SIGNAL_FILE = "signal.json"
 SENT_MACRO_FILE = "sent_macro.json"
 SENT_NEWS_FILE = "sent_news.txt"
 
-# Umbrales
-SENTIMENT_THRESHOLD = 0.2
+# Umbrales y constantes
+SENTIMENT_THRESHOLD = 0.2          # para alertas de Telegram
 HIGH_IMPACT_WORDS = ['emergency', 'attack', 'hike', 'sec', 'etf', 'fomc', 'powell', 'ataque', 'emergencia', 'guerra']
+WEIGHTED_INTENSITY_WINDOW_HOURS = 6   # ventana de tiempo para intensidad de noticias
+MACRO_CONTRIBUTION_BASE = 30          # base de intensidad por evento macro alto
+
+# Inicializar analizador VADER
+sentiment_analyzer = SentimentIntensityAnalyzer()
 
 # ==================== FUNCIONES COMUNES ====================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -190,31 +196,31 @@ def macro_job():
         minutes_left = (ev["datetime"] - now).total_seconds() / 60
         if minutes_left <= 180 and ev["impact"] == "High":
             signal_macro["has_high_impact"] = True
+            # Guardamos más información para la intensidad
             signal_macro["events"].append({
                 "event": ev["event"],
                 "time_minutes": round(minutes_left),
                 "impact": ev["impact"],
-                "bias": "bajista si sorprende al alza" if "CPI" in ev["event"] else "volátil"
+                "bias": "bajista si sorprende al alza" if "CPI" in ev["event"] else "volátil",
+                "intensity_contribution": MACRO_CONTRIBUTION_BASE * (1 - minutes_left/180)  # más cerca = más intensidad
             })
     return signal_macro
 
 # ==================== MÓDULO NOTICIAS ====================
-def analyze_sentiment_simple(text):
-    positive = ["rally", "surge", "gain", "up", "bull", "green", "approve", "good", "strong", "alza", "sube", "verde", "aprueba"]
-    negative = ["crash", "drop", "down", "bear", "red", "reject", "fail", "emergency", "attack", "war", "caída", "baja", "rojo", "rechaza", "fracaso", "emergencia", "ataque", "guerra"]
-    words = text.lower().split()
-    score = 0
-    for w in words:
-        if w in positive:
-            score += 0.1
-        elif w in negative:
-            score -= 0.1
-    return max(-1, min(1, score))
+# Almacenamiento de noticias recientes para intensidad temporal
+recent_news = []  # cada elemento: {"timestamp": datetime, "weighted_sentiment": float, "source_weight": float}
+
+def clean_old_news():
+    """Elimina noticias más antiguas que WEIGHTED_INTENSITY_WINDOW_HOURS."""
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=WEIGHTED_INTENSITY_WINDOW_HOURS)
+    global recent_news
+    recent_news = [n for n in recent_news if n["timestamp"] > cutoff]
 
 def fetch_news():
     sent_links = load_sent_links()
     new_items = []
-    for feed_url in RSS_FEEDS:
+    for feed_url, weight in RSS_FEEDS.items():
         try:
             feed = feedparser.parse(feed_url)
             for entry in feed.entries[:15]:
@@ -223,9 +229,9 @@ def fetch_news():
                 if not link or link in sent_links:
                     continue
                 if any(kw in title.lower() for kw in KEYWORDS):
-                    sentiment = analyze_sentiment_simple(title)
+                    # Obtener sentimiento VADER (compound)
+                    sentiment = sentiment_analyzer.polarity_scores(title)["compound"]
                     title_es = translate_title(title)
-                    # Palabras clave que activaron la noticia
                     triggered_keywords = [kw for kw in KEYWORDS if kw in title.lower()]
                     new_items.append({
                         "title_original": title,
@@ -233,7 +239,9 @@ def fetch_news():
                         "link": link,
                         "source": feed_url,
                         "sentiment": sentiment,
-                        "keywords": triggered_keywords[:3]  # solo las 3 primeras para no abusar
+                        "source_weight": weight,
+                        "keywords": triggered_keywords[:3],
+                        "timestamp": datetime.now(timezone.utc)
                     })
         except Exception as e:
             logging.error(f"Error RSS {feed_url}: {e}")
@@ -247,6 +255,17 @@ def news_job():
 
     signal_news = {"recent_count": 0, "latest_sentiment": 0, "has_emergency": False}
     for item in news:
+        # Guardar para intensidad temporal
+        weighted_sent = item["sentiment"] * item["source_weight"]
+        recent_news.append({
+            "timestamp": item["timestamp"],
+            "weighted_sentiment": weighted_sent,
+            "source_weight": item["source_weight"]
+        })
+        # Limpiar viejos
+        clean_old_news()
+
+        # Enviar alerta si sentimiento fuerte o palabras de alto impacto
         title_lower = (item["title"] + " " + item["title_original"]).lower()
         is_high_impact = any(w in title_lower for w in HIGH_IMPACT_WORDS)
         if abs(item["sentiment"]) > SENTIMENT_THRESHOLD or is_high_impact:
@@ -266,37 +285,101 @@ def news_job():
         signal_news["latest_sentiment"] = item["sentiment"]
         if "emergency" in title_lower or "attack" in title_lower or "emergencia" in title_lower or "ataque" in title_lower:
             signal_news["has_emergency"] = True
+
     return signal_news
+
+# ==================== INTENSIDAD Y SEÑAL CONTINUA ====================
+def compute_intensity(macro_signal):
+    """
+    Calcula la intensidad actual basada en:
+    - Noticias recientes (suma de |weighted_sentiment|)
+    - Eventos macro próximos (contribución inversa al tiempo)
+    """
+    # Intensidad de noticias: suma absoluta de weighted_sentiment en ventana
+    news_intensity = sum(abs(n["weighted_sentiment"]) for n in recent_news)
+
+    # Intensidad macro: suma de contribuciones de eventos (cada evento da hasta MACRO_CONTRIBUTION_BASE)
+    macro_intensity = sum(ev.get("intensity_contribution", 0) for ev in macro_signal.get("events", []))
+
+    total_intensity = news_intensity + macro_intensity
+    return total_intensity
+
+def compute_score_and_state(total_intensity):
+    """
+    Convierte intensidad en un score 0-100 y estado de mercado.
+    Se usa una escala empírica: ajustar según observación.
+    """
+    # Escala máxima esperada (ajustable)
+    max_expected = 50.0   # ajusta según pruebas
+    score = min(100, int((total_intensity / max_expected) * 100))
+    score = max(0, score)
+
+    if score < 20:
+        state = "Calm"
+        volatility_spike = False
+        panic_mode = False
+    elif score < 40:
+        state = "Build-up"
+        volatility_spike = False
+        panic_mode = False
+    elif score < 70:
+        state = "Volatility spike"
+        volatility_spike = True
+        panic_mode = False
+    else:
+        state = "Panic mode"
+        volatility_spike = True
+        panic_mode = True
+
+    return score, state, volatility_spike, panic_mode
 
 # ==================== GENERADOR DE SEÑAL GLOBAL ====================
 def update_signal():
     macro_signal = macro_job() or {"has_high_impact": False, "events": []}
     news_signal = news_job() or {"recent_count": 0, "latest_sentiment": 0, "has_emergency": False}
 
-    alert_level = 0
+    # Calcular intensidad total
+    total_intensity = compute_intensity(macro_signal)
+    score, state, volatility_spike, panic_mode = compute_score_and_state(total_intensity)
+
+    # Para compatibilidad con la antigua señal, mantenemos alert_level
+    # Alert level basado en score
+    if score >= 70:
+        alert_level = 3
+    elif score >= 40:
+        alert_level = 2
+    elif score >= 20:
+        alert_level = 1
+    else:
+        alert_level = 0
+
+    # Construir mensaje resumen para el campo "message"
     message_parts = []
     if macro_signal["has_high_impact"]:
-        alert_level += 2
         ev = macro_signal["events"][0] if macro_signal["events"] else {}
-        message_parts.append(f"Evento {ev.get('event','macro')} en {ev.get('time_minutes',0)} min (Alto impacto).")
+        message_parts.append(f"Evento {ev.get('event','macro')} en {ev.get('time_minutes',0)} min.")
     if news_signal["has_emergency"]:
-        alert_level += 1
-        message_parts.append("Noticia de emergencia detectada.")
+        message_parts.append("Noticia de emergencia.")
     if abs(news_signal["latest_sentiment"]) > 0.5:
-        alert_level += 1
         message_parts.append(f"Sentimiento extremo: {news_signal['latest_sentiment']:.2f}.")
-
     combined_message = " ".join(message_parts) if message_parts else "Sin alertas significativas."
 
     signal_data = {
         "last_update": datetime.utcnow().isoformat() + "Z",
         "macro": macro_signal,
         "news": news_signal,
+        # Nuevos campos para señal continua
+        "intensity": round(total_intensity, 2),
+        "score": score,
+        "market_state": state,
+        "volatility_spike": volatility_spike,
+        "panic_mode": panic_mode,
+        # Campos legacy (por compatibilidad)
         "alert_level": alert_level,
         "message": combined_message
     }
     save_json(SIGNAL_FILE, signal_data)
-    logging.info(f"Señal actualizada: nivel {alert_level}")
+    logging.info(f"Señal actualizada: score={score}, state={state}")
 
 # ==================== SERVIDOR FLASK ====================
 app = Flask(__name__)
@@ -317,39 +400,35 @@ def run_flask():
 def enviar_status_inicial():
     logging.info("Generando status inicial mejorado...")
     macro_events = fetch_macro_events()
-    news_items = fetch_news()
+    news_items = fetch_news()  # esto ya llena recent_news con sus timestamps
+    clean_old_news()
 
-    # Calcular alert_level inicial
-    alert_level = 0
-    if any(ev["impact"] == "High" for ev in macro_events):
-        alert_level += 2
-    if any("emergency" in n["title_original"].lower() or "attack" in n["title_original"].lower() for n in news_items):
-        alert_level += 1
-    avg_sentiment = sum(n["sentiment"] for n in news_items) / len(news_items) if news_items else 0
-    if abs(avg_sentiment) > 0.5:
-        alert_level += 1
+    # Calcular intensidad inicial
+    macro_signal = macro_job() or {"has_high_impact": False, "events": []}
+    total_intensity = compute_intensity(macro_signal)
+    score, state, vol_spike, panic = compute_score_and_state(total_intensity)
 
-    # Palabras clave más frecuentes en las noticias detectadas
+    # Palabras clave más frecuentes
     all_keywords = []
     for n in news_items:
         all_keywords.extend(n["keywords"])
     keyword_counts = Counter(all_keywords).most_common(5)
 
-    # Construir mensaje
+    # Sentimiento promedio (pesado por fuente)
+    avg_sentiment = sum(n["sentiment"] * n["source_weight"] for n in news_items) / (sum(n["source_weight"] for n in news_items) or 1)
+
     lines = []
     lines.append("🤖 *Bot Fundamental - Estado actual*")
     lines.append("")
     lines.append(f"📅 *Macro*: revisión cada {MACRO_INTERVAL_MINUTES} min")
     lines.append(f"📰 *Noticias*: revisión cada {NEWS_INTERVAL_MINUTES} min")
     lines.append("")
-    lines.append(f"🔔 *Nivel de alerta*: `{alert_level}`")
-    if alert_level == 0:
-        lines.append("   └─ Entorno normal, sin alertas.")
-    elif alert_level == 1:
-        lines.append("   └─ Atención: posible volatilidad.")
-    else:
-        lines.append("   └─ Alta volatilidad inminente.")
-
+    lines.append(f"🔔 *Score de mercado*: `{score}` (0-100)")
+    lines.append(f"   └─ Estado: *{state}*")
+    if vol_spike:
+        lines.append("   └─ ⚡ Volatilidad inminente")
+    if panic:
+        lines.append("   └─ 🚨 Modo pánico")
     lines.append("")
     if macro_events:
         lines.append("*📆 Próximos eventos macro:*")
@@ -363,7 +442,8 @@ def enviar_status_inicial():
     lines.append("")
     if news_items:
         lines.append(f"*📰 Noticias detectadas:* {len(news_items)} en total")
-        lines.append(f"   📊 Sentimiento promedio: {avg_sentiment:.2f}")
+        lines.append(f"   📊 Sentimiento promedio ponderado: {avg_sentiment:.2f}")
+        lines.append(f"   🔥 Intensidad noticias (últimas {WEIGHTED_INTENSITY_WINDOW_HOURS}h): {total_intensity:.2f}")
         if keyword_counts:
             lines.append("   🔑 Palabras clave más frecuentes:")
             for kw, count in keyword_counts:
@@ -371,19 +451,18 @@ def enviar_status_inicial():
         lines.append("")
         lines.append("*Ejemplos:*")
         for n in news_items[:3]:
-            # Mostrar título traducido, palabras clave y sentimiento
             kw_str = ", ".join(n["keywords"]) if n["keywords"] else "ninguna"
             lines.append(f"   📌 *{n['title'][:70]}...*")
-            lines.append(f"      🔑 {kw_str} | 📊 sentimiento {n['sentiment']:.2f}")
+            lines.append(f"      🔑 {kw_str} | 📊 sentimiento {n['sentiment']:.2f} (peso {n['source_weight']:.1f})")
         if len(news_items) > 3:
             lines.append(f"   ... y {len(news_items)-3} más.")
     else:
         lines.append("*📰 No se encontraron noticias con palabras clave.*")
 
     lines.append("")
-    lines.append("🔄 *Fuentes RSS activas:*")
-    for src in RSS_FEEDS:
-        lines.append(f"   • {src.split('/')[2]}")
+    lines.append("🔄 *Fuentes RSS con peso:*")
+    for src, w in RSS_FEEDS.items():
+        lines.append(f"   • {src.split('/')[2]} (peso {w})")
 
     send_telegram("\n".join(lines))
 
