@@ -1,10 +1,10 @@
 import os
-import feedparser
-import requests
-import tweepy
-import hashlib
+import json
 import time
 import logging
+import hashlib
+import requests
+import feedparser
 from datetime import datetime, timedelta
 from textblob import TextBlob
 from apscheduler.schedulers.background import BackgroundScheduler
