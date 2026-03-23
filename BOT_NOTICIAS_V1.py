@@ -9,7 +9,8 @@ from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.background import BackgroundScheduler
 from bs4 import BeautifulSoup
 from flask import Flask, jsonify
-from deep_translator import GoogleTranslator  # Traducción gratuita
+from deep_translator import GoogleTranslator
+from collections import Counter
 
 # ==================== CONFIGURACIÓN ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -19,7 +20,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 MACRO_INTERVAL_MINUTES = int(os.getenv("MACRO_INTERVAL_MINUTES", "60"))
 NEWS_INTERVAL_MINUTES = int(os.getenv("NEWS_INTERVAL_MINUTES", "30"))
 
-# Palabras clave para noticias (en español e inglés, por si acaso)
+# Palabras clave para noticias (español e inglés)
 KEYWORDS = [
     "bitcoin", "btc", "cripto", "ethereum", "fed", "tasa", "inflación",
     "sec", "etf", "jpmorgan", "blackrock", "ataque", "guerra", "irán",
@@ -39,7 +40,7 @@ SENT_MACRO_FILE = "sent_macro.json"
 SENT_NEWS_FILE = "sent_news.txt"
 
 # Umbrales
-SENTIMENT_THRESHOLD = 0.2   # reducido para capturar más
+SENTIMENT_THRESHOLD = 0.2
 HIGH_IMPACT_WORDS = ['emergency', 'attack', 'hike', 'sec', 'etf', 'fomc', 'powell', 'ataque', 'emergencia', 'guerra']
 
 # ==================== FUNCIONES COMUNES ====================
@@ -90,13 +91,11 @@ def load_sent_links():
 translator = GoogleTranslator(source='en', target='es')
 
 def translate_title(title):
-    """Traduce un título del inglés al español."""
     try:
-        # Limitar longitud para evitar problemas con la API gratuita
         return translator.translate(title[:500])
     except Exception as e:
         logging.warning(f"Error traduciendo: {e}")
-        return title  # Devuelve el original si falla
+        return title
 
 # ==================== MÓDULO MACRO ====================
 def parse_event_datetime(date_str, time_str):
@@ -223,17 +222,18 @@ def fetch_news():
                 link = entry.get('link', '')
                 if not link or link in sent_links:
                     continue
-                # Verificar relevancia por palabras clave en inglés (original)
                 if any(kw in title.lower() for kw in KEYWORDS):
                     sentiment = analyze_sentiment_simple(title)
-                    # Traducir título al español
                     title_es = translate_title(title)
+                    # Palabras clave que activaron la noticia
+                    triggered_keywords = [kw for kw in KEYWORDS if kw in title.lower()]
                     new_items.append({
                         "title_original": title,
                         "title": title_es,
                         "link": link,
                         "source": feed_url,
-                        "sentiment": sentiment
+                        "sentiment": sentiment,
+                        "keywords": triggered_keywords[:3]  # solo las 3 primeras para no abusar
                     })
         except Exception as e:
             logging.error(f"Error RSS {feed_url}: {e}")
@@ -313,37 +313,77 @@ def get_signal():
 def run_flask():
     app.run(host='0.0.0.0', port=5000)
 
-# ==================== FUNCIÓN DE PRUEBA INICIAL ====================
+# ==================== REPORTE MEJORADO ====================
 def enviar_status_inicial():
-    """Envía un mensaje a Telegram con el estado actual (próximos eventos y noticias recientes)."""
-    logging.info("Generando status inicial...")
+    logging.info("Generando status inicial mejorado...")
     macro_events = fetch_macro_events()
     news_items = fetch_news()
 
-    lines = []
-    lines.append("🤖 *Bot Fundamental iniciado*")
-    lines.append(f"📅 Macro: revisión cada {MACRO_INTERVAL_MINUTES} min")
-    lines.append(f"📰 Noticias: revisión cada {NEWS_INTERVAL_MINUTES} min")
-    lines.append("")
+    # Calcular alert_level inicial
+    alert_level = 0
+    if any(ev["impact"] == "High" for ev in macro_events):
+        alert_level += 2
+    if any("emergency" in n["title_original"].lower() or "attack" in n["title_original"].lower() for n in news_items):
+        alert_level += 1
+    avg_sentiment = sum(n["sentiment"] for n in news_items) / len(news_items) if news_items else 0
+    if abs(avg_sentiment) > 0.5:
+        alert_level += 1
 
-    if macro_events:
-        lines.append("*Próximos eventos macro:*")
-        for ev in macro_events[:5]:
-            lines.append(f"• {ev['event']} ({ev['impact']}) - {ev['datetime'].strftime('%d/%m %H:%M UTC')}")
-        if len(macro_events) > 5:
-            lines.append(f"... y {len(macro_events)-5} más.")
+    # Palabras clave más frecuentes en las noticias detectadas
+    all_keywords = []
+    for n in news_items:
+        all_keywords.extend(n["keywords"])
+    keyword_counts = Counter(all_keywords).most_common(5)
+
+    # Construir mensaje
+    lines = []
+    lines.append("🤖 *Bot Fundamental - Estado actual*")
+    lines.append("")
+    lines.append(f"📅 *Macro*: revisión cada {MACRO_INTERVAL_MINUTES} min")
+    lines.append(f"📰 *Noticias*: revisión cada {NEWS_INTERVAL_MINUTES} min")
+    lines.append("")
+    lines.append(f"🔔 *Nivel de alerta*: `{alert_level}`")
+    if alert_level == 0:
+        lines.append("   └─ Entorno normal, sin alertas.")
+    elif alert_level == 1:
+        lines.append("   └─ Atención: posible volatilidad.")
     else:
-        lines.append("No hay eventos macro relevantes en las próximas 24h.")
+        lines.append("   └─ Alta volatilidad inminente.")
+
+    lines.append("")
+    if macro_events:
+        lines.append("*📆 Próximos eventos macro:*")
+        for ev in macro_events[:5]:
+            lines.append(f"   • {ev['event']} ({ev['impact']}) - {ev['datetime'].strftime('%d/%m %H:%M UTC')}")
+        if len(macro_events) > 5:
+            lines.append(f"   ... y {len(macro_events)-5} más.")
+    else:
+        lines.append("*📆 No hay eventos macro relevantes en las próximas 24h.*")
 
     lines.append("")
     if news_items:
-        lines.append("*Noticias recientes detectadas:*")
+        lines.append(f"*📰 Noticias detectadas:* {len(news_items)} en total")
+        lines.append(f"   📊 Sentimiento promedio: {avg_sentiment:.2f}")
+        if keyword_counts:
+            lines.append("   🔑 Palabras clave más frecuentes:")
+            for kw, count in keyword_counts:
+                lines.append(f"      - {kw} ({count} veces)")
+        lines.append("")
+        lines.append("*Ejemplos:*")
         for n in news_items[:3]:
-            lines.append(f"• {n['title'][:80]}... (sentimiento {n['sentiment']:.2f})")
+            # Mostrar título traducido, palabras clave y sentimiento
+            kw_str = ", ".join(n["keywords"]) if n["keywords"] else "ninguna"
+            lines.append(f"   📌 *{n['title'][:70]}...*")
+            lines.append(f"      🔑 {kw_str} | 📊 sentimiento {n['sentiment']:.2f}")
         if len(news_items) > 3:
-            lines.append(f"... y {len(news_items)-3} más.")
+            lines.append(f"   ... y {len(news_items)-3} más.")
     else:
-        lines.append("No se encontraron noticias con palabras clave.")
+        lines.append("*📰 No se encontraron noticias con palabras clave.*")
+
+    lines.append("")
+    lines.append("🔄 *Fuentes RSS activas:*")
+    for src in RSS_FEEDS:
+        lines.append(f"   • {src.split('/')[2]}")
 
     send_telegram("\n".join(lines))
 
