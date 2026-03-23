@@ -1,247 +1,200 @@
 import os
-import json
-import logging
-import time
+import feedparser
 import requests
-from bs4 import BeautifulSoup
-from datetime import datetime, timedelta, timezone
+import tweepy
+import hashlib
+import time
+import logging
+from datetime import datetime, timedelta
+from textblob import TextBlob
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# ==================== CONFIGURACIÓN ====================
+# Configuración
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-# Intervalo en horas entre ejecuciones (se puede cambiar por variable de entorno)
-INTERVAL_HOURS = int(os.getenv("MACRO_BOT_INTERVAL_HOURS", "2"))
+INTERVAL_MINUTES = int(os.getenv("NEWS_INTERVAL_MINUTES", "10"))
+TWITTER_BEARER = os.getenv("TWITTER_BEARER_TOKEN")
+NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")
 
-# Archivo para recordar eventos ya notificados (se crea en el mismo directorio)
-SENT_EVENTS_FILE = "sent_events.json"
+# Fuentes RSS (pueden variar)
+RSS_FEEDS = [
+    "https://www.reuters.com/rss/topNews",
+    "https://www.bloomberg.com/feed/podcast/etf-report.xml",  # limitado
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://news.google.com/rss?q=bitcoin+OR+btc+OR+fed+OR+sec&hl=en-US&gl=US&ceid=US:en"
+]
 
-# Headers para evitar bloqueos por parte de Investing.com
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-}
+# Palabras clave para filtrar relevancia
+KEYWORDS = ["bitcoin", "btc", "crypto", "ethereum", "fed", "rate", "inflation", "sec", "etf", "jpmorgan", "blackrock"]
 
-CALENDAR_URL = "https://www.investing.com/economic-calendar/"
+# Archivo para recordar noticias ya enviadas
+SENT_NEWS_FILE = "sent_news.json"
 
-# Mapeo de impacto a emojis
-IMPACT_MAP = {
-    "High": "🔴 ALTO",
-    "Medium": "🟡 MEDIO",
-    "Low": "⚪ BAJO"
-}
+def load_sent_news():
+    if os.path.exists(SENT_NEWS_FILE):
+        with open(SENT_NEWS_FILE, 'r') as f:
+            return set(json.load(f))
+    return set()
 
-# Configurar logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+def save_sent_news(news_id):
+    sent = load_sent_news()
+    sent.add(news_id)
+    with open(SENT_NEWS_FILE, 'w') as f:
+        json.dump(list(sent), f)
 
-# ==================== FUNCIONES AUXILIARES ====================
-def send_telegram_message(message):
-    """Envía un mensaje al chat de Telegram configurado."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.error("Faltan variables de entorno TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
-    try:
-        r = requests.post(url, json=payload, timeout=10)
-        r.raise_for_status()
-        logging.info("Mensaje enviado a Telegram")
-    except Exception as e:
-        logging.error(f"Error enviando mensaje a Telegram: {e}")
+def send_telegram(message):
+    # igual que en macro bot
+    pass
 
-def load_sent_events():
-    """Carga la lista de IDs de eventos ya notificados desde el archivo JSON."""
-    if os.path.exists(SENT_EVENTS_FILE):
+def get_news_id(title, source, date):
+    unique = f"{source}|{title}|{date}"
+    return hashlib.md5(unique.encode()).hexdigest()
+
+def analyze_sentiment(text):
+    blob = TextBlob(text)
+    polarity = blob.sentiment.polarity  # -1..1
+    return polarity
+
+def is_relevant(title, description):
+    text = (title + " " + description).lower()
+    for kw in KEYWORDS:
+        if kw in text:
+            return True
+    return False
+
+def fetch_rss_news():
+    news = []
+    for feed_url in RSS_FEEDS:
         try:
-            with open(SENT_EVENTS_FILE, 'r') as f:
-                return json.load(f)
+            feed = feedparser.parse(feed_url)
+            for entry in feed.entries[:10]:  # top 10
+                title = entry.get('title', '')
+                summary = entry.get('summary', '')
+                link = entry.get('link', '')
+                published = entry.get('published', '')
+                if is_relevant(title, summary):
+                    news_id = get_news_id(title, feed_url, published)
+                    polarity = analyze_sentiment(title + " " + summary)
+                    news.append({
+                        'id': news_id,
+                        'title': title,
+                        'summary': summary[:200],
+                        'link': link,
+                        'source': feed_url,
+                        'published': published,
+                        'sentiment': polarity
+                    })
         except Exception as e:
-            logging.error(f"Error cargando {SENT_EVENTS_FILE}: {e}")
-            return []
+            logging.error(f"Error en RSS {feed_url}: {e}")
+    return news
+
+def fetch_twitter_news():
+    if not TWITTER_BEARER:
+        return []
+    try:
+        client = tweepy.Client(bearer_token=TWITTER_BEARER)
+        # Buscar tweets con palabras clave de los últimos 10 minutos
+        start_time = (datetime.utcnow() - timedelta(minutes=INTERVAL_MINUTES)).isoformat() + "Z"
+        query = "(" + " OR ".join(KEYWORDS) + ") -is:retweet"
+        tweets = client.search_recent_tweets(query=query, max_results=10, start_time=start_time)
+        if tweets.data:
+            result = []
+            for tweet in tweets.data:
+                news_id = get_news_id(tweet.text, "twitter", tweet.id)
+                polarity = analyze_sentiment(tweet.text)
+                result.append({
+                    'id': news_id,
+                    'title': tweet.text[:100],
+                    'summary': tweet.text,
+                    'link': f"https://twitter.com/i/web/status/{tweet.id}",
+                    'source': 'twitter',
+                    'published': str(tweet.created_at),
+                    'sentiment': polarity
+                })
+            return result
+    except Exception as e:
+        logging.error(f"Twitter API error: {e}")
     return []
 
-def save_sent_event(event_id):
-    """Guarda un ID de evento como ya notificado."""
-    sent = load_sent_events()
-    if event_id not in sent:
-        sent.append(event_id)
-        try:
-            with open(SENT_EVENTS_FILE, 'w') as f:
-                json.dump(sent, f)
-        except Exception as e:
-            logging.error(f"Error guardando {SENT_EVENTS_FILE}: {e}")
-
-def parse_event_datetime(date_str, time_str):
-    """
-    Convierte strings de fecha y hora (ej. 'Mar 25', '14:30') en un objeto datetime UTC.
-    """
+def fetch_newsapi_news():
+    if not NEWSAPI_KEY:
+        return []
     try:
-        combined = f"{date_str} {time_str}".strip()
-        # Intentar con formato sin año
-        for fmt in ["%b %d %H:%M", "%b %d, %Y %H:%M"]:
-            try:
-                dt = datetime.strptime(combined, fmt)
-                if dt.year == 1900:
-                    dt = dt.replace(year=datetime.now().year)
-                # Asumimos que la hora está en UTC (Investing.com usa hora del servidor, pero simplificamos)
-                return dt.replace(tzinfo=timezone.utc)
-            except ValueError:
-                continue
-        logging.warning(f"No se pudo parsear fecha/hora: {date_str} / {time_str}")
-        return None
+        url = "https://newsapi.org/v2/everything"
+        params = {
+            'q': 'bitcoin OR btc OR cryptocurrency OR federal reserve',
+            'apiKey': NEWSAPI_KEY,
+            'language': 'en',
+            'pageSize': 10,
+            'from': (datetime.utcnow() - timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'sortBy': 'publishedAt'
+        }
+        resp = requests.get(url, params=params)
+        data = resp.json()
+        if data['status'] == 'ok':
+            news = []
+            for article in data['articles']:
+                title = article.get('title', '')
+                description = article.get('description', '')
+                if is_relevant(title, description):
+                    news_id = get_news_id(title, article['source']['name'], article['publishedAt'])
+                    polarity = analyze_sentiment(title + " " + description)
+                    news.append({
+                        'id': news_id,
+                        'title': title,
+                        'summary': description[:200],
+                        'link': article['url'],
+                        'source': article['source']['name'],
+                        'published': article['publishedAt'],
+                        'sentiment': polarity
+                    })
+            return news
     except Exception as e:
-        logging.error(f"Error parseando datetime: {e}")
-        return None
+        logging.error(f"NewsAPI error: {e}")
+    return []
 
-def get_bias(event):
-    """Devuelve un sesgo orientativo según el tipo de evento."""
-    name = event['event']
-    if "CPI" in name or "PPI" in name:
-        return "⚠️ Bajista si sorprende al alza"
-    if "Nonfarm Payrolls" in name:
-        return "⚠️ Bajista si muy fuerte"
-    if "Fed" in name or "FOMC" in name:
-        return "⚠️ Alta volatilidad, dirección incierta"
-    if "GDP" in name:
-        return "✅ Alcista si supera expectativas"
-    if "Unemployment" in name:
-        return "📉 Puede generar volatilidad"
-    return "🔄 Esperar volatilidad"
-
-def format_event_message(event):
-    """Formatea un evento para enviarlo por Telegram."""
-    impact_text = IMPACT_MAP.get(event['impact'], "⚪ DESCONOCIDO")
-    dt = event['datetime']
-    time_str = dt.strftime("%H:%M UTC")
-    date_str = dt.strftime("%d/%m")
+def format_news_message(item):
+    sentiment_emoji = "🔵 NEUTRAL"
+    polarity = item['sentiment']
+    if polarity > 0.2:
+        sentiment_emoji = "🟢 ALCISTA"
+    elif polarity < -0.2:
+        sentiment_emoji = "🔴 BAJISTA"
     message = (
-        f"📅 *{event['event']}*\n"
-        f"🗓️ {date_str} - {time_str}\n"
-        f"🌍 {event['country']}\n"
-        f"⚡ Impacto: {impact_text}\n"
-        f"📊 Esperado: {event['forecast']} | Previo: {event['previous']}\n"
-        f"📈 Sesgo: {get_bias(event)}\n"
+        f"📰 *NOTICIA RELEVANTE*\n"
+        f"📌 *{item['title']}*\n"
+        f"📝 {item['summary']}\n"
+        f"🔗 [Leer más]({item['link']})\n"
+        f"📊 Sentimiento: {sentiment_emoji} ({polarity:.2f})\n"
+        f"🏷️ Fuente: {item['source']}\n"
+        f"🕒 {item['published'][:16]}"
     )
     return message
 
-def fetch_events():
-    """
-    Scrapea Investing.com y devuelve una lista de eventos de las próximas 24h
-    que tengan impacto 'High' o 'Medium'.
-    """
-    try:
-        response = requests.get(CALENDAR_URL, headers=HEADERS, timeout=15)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-
-        # La tabla de eventos suele tener id 'economicCalendarData' o clase 'ecoCal'
-        table = soup.find('table', {'id': 'economicCalendarData'})
-        if not table:
-            table = soup.find('table', class_='ecoCal')
-        if not table:
-            logging.error("No se encontró la tabla de eventos")
-            return []
-
-        events = []
-        now = datetime.now(timezone.utc)
-        tomorrow = now + timedelta(days=1)
-
-        rows = table.find('tbody').find_all('tr')
-        for row in rows:
-            cells = row.find_all('td')
-            if len(cells) < 5:
-                continue
-
-            # Fecha y hora
-            date_cell = cells[0].get_text(strip=True)
-            time_cell = cells[1].get_text(strip=True) if len(cells) > 1 else ""
-            event_dt = parse_event_datetime(date_cell, time_cell)
-            if not event_dt:
-                continue
-
-            # Solo eventos en las próximas 24h
-            if event_dt < now or event_dt > tomorrow:
-                continue
-
-            # País (a veces hay una bandera)
-            country = cells[2].get_text(strip=True) if len(cells) > 2 else ""
-            # Nombre del evento
-            event_name = cells[3].get_text(strip=True) if len(cells) > 3 else ""
-
-            # Impacto
-            impact_cell = cells[4]
-            impact = "Low"
-            if impact_cell.find('span', class_='high'):
-                impact = "High"
-            elif impact_cell.find('span', class_='medium'):
-                impact = "Medium"
-
-            # Datos económicos
-            actual = cells[5].get_text(strip=True) if len(cells) > 5 else ""
-            forecast = cells[6].get_text(strip=True) if len(cells) > 6 else ""
-            previous = cells[7].get_text(strip=True) if len(cells) > 7 else ""
-
-            # Solo nos interesan eventos de impacto alto o medio
-            if impact not in ['High', 'Medium']:
-                continue
-
-            event_id = f"{event_dt.isoformat()}_{event_name}"
-            events.append({
-                "id": event_id,
-                "datetime": event_dt,
-                "country": country,
-                "event": event_name,
-                "impact": impact,
-                "actual": actual,
-                "forecast": forecast,
-                "previous": previous
-            })
-
-        return events
-    except Exception as e:
-        logging.error(f"Error en fetch_events: {e}")
-        return []
-
 def main_job():
-    """Tarea principal: obtiene eventos y notifica los nuevos."""
-    logging.info("Ejecutando macro_hunter...")
-    events = fetch_events()
-    if not events:
-        logging.info("No se encontraron eventos relevantes en las próximas 24h.")
-        return
+    logging.info("Ejecutando news monitor...")
+    all_news = []
+    all_news.extend(fetch_rss_news())
+    all_news.extend(fetch_twitter_news())
+    all_news.extend(fetch_newsapi_news())
 
-    sent_ids = load_sent_events()
-    new_events = [e for e in events if e['id'] not in sent_ids]
+    sent_ids = load_sent_news()
+    new_news = [n for n in all_news if n['id'] not in sent_ids]
 
-    for event in new_events:
-        msg = format_event_message(event)
-        send_telegram_message(msg)
-        save_sent_event(event['id'])
-        time.sleep(1)  # evitar rate limit de Telegram
+    # Filtrar noticias con sentimiento significativo o palabras clave muy relevantes
+    for news in new_news:
+        # Enviar si sentimiento fuerte (|polarity| > 0.3) o si tiene palabras de alto impacto
+        if abs(news['sentiment']) > 0.3 or any(kw in news['title'].lower() for kw in ['emergency', 'hike', 'attack', 'sec', 'etf']):
+            msg = format_news_message(news)
+            send_telegram(msg)
+            save_sent_news(news['id'])
+            time.sleep(1)
+    logging.info(f"Procesadas {len(all_news)} noticias, enviadas {len(new_news)} nuevas.")
 
-    logging.info(f"Procesados {len(events)} eventos, notificados {len(new_events)} nuevos.")
-
-# ==================== INICIO ====================
 if __name__ == "__main__":
-    # Mensaje de inicio para confirmar que el bot está corriendo
-    send_telegram_message("🤖 *Bot Macro Hunter iniciado* 🤖\n\nMonitoreando eventos macroeconómicos cada {} hora(s).".format(INTERVAL_HOURS))
-
-    # Configurar scheduler
+    send_telegram("📰 *Bot de Noticias v1 iniciado*")
     scheduler = BackgroundScheduler()
-    scheduler.add_job(main_job, 'interval', hours=INTERVAL_HOURS)
+    scheduler.add_job(main_job, 'interval', minutes=INTERVAL_MINUTES)
     scheduler.start()
-    logging.info(f"Macro Hunter iniciado. Intervalo: cada {INTERVAL_HOURS} hora(s).")
-
-    try:
-        # Mantener el script en ejecución
-        while True:
-            time.sleep(60)
-    except KeyboardInterrupt:
-        logging.info("Deteniendo scheduler...")
-        scheduler.shutdown()
+    while True:
+        time.sleep(60)
