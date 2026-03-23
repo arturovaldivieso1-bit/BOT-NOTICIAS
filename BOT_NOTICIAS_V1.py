@@ -2,17 +2,19 @@ import os
 import time
 import json
 import logging
+import threading
 import requests
 import feedparser
 from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.background import BackgroundScheduler
-from bs4 import BeautifulSoup  # solo para macro
+from bs4 import BeautifulSoup
+from flask import Flask, jsonify
 
 # ==================== CONFIGURACIÓN ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Intervalos (en minutos)
+# Intervalos (en minutos) – ajustables por variables de entorno
 MACRO_INTERVAL_MINUTES = int(os.getenv("MACRO_INTERVAL_MINUTES", "60"))   # macro cada 60 min
 NEWS_INTERVAL_MINUTES = int(os.getenv("NEWS_INTERVAL_MINUTES", "30"))     # noticias cada 30 min
 
@@ -151,7 +153,7 @@ def macro_job():
     logging.info("Ejecutando macro_job...")
     events = fetch_macro_events()
     if not events:
-        return
+        return {"has_high_impact": False, "events": []}
 
     sent = load_json(SENT_MACRO_FILE, {})
     now = datetime.now(timezone.utc)
@@ -159,16 +161,24 @@ def macro_job():
     for ev in events:
         event_id = ev["datetime"].isoformat() + "_" + ev["event"]
         if event_id not in sent:
-            # Enviar alerta si es High o Medium
+            # Enviar alerta solo si es High (evitamos spam)
             if ev["impact"] == "High":
-                msg = f"📅 *EVENTO MACRO*\n{ev['event']}\n🗓️ {ev['datetime'].strftime('%d/%m %H:%M UTC')}\n🌍 {ev['country']}\n⚡ Impacto: 🔴 ALTO\n📊 Esperado: {ev['forecast']} | Previo: {ev['previous']}"
+                msg = (
+                    f"📅 *EVENTO MACRO*\n"
+                    f"{ev['event']}\n"
+                    f"🗓️ {ev['datetime'].strftime('%d/%m %H:%M UTC')}\n"
+                    f"🌍 {ev['country']}\n"
+                    f"⚡ Impacto: 🔴 ALTO\n"
+                    f"📊 Esperado: {ev['forecast']} | Previo: {ev['previous']}"
+                )
                 send_telegram(msg)
                 sent[event_id] = True
                 save_json(SENT_MACRO_FILE, sent)
                 time.sleep(1)
-        # Construir señal
+
+        # Construir señal para eventos próximos (menos de 3h)
         minutes_left = (ev["datetime"] - now).total_seconds() / 60
-        if minutes_left <= 180 and ev["impact"] == "High":   # próximas 3h
+        if minutes_left <= 180 and ev["impact"] == "High":
             signal_macro["has_high_impact"] = True
             signal_macro["events"].append({
                 "event": ev["event"],
@@ -176,12 +186,10 @@ def macro_job():
                 "impact": ev["impact"],
                 "bias": "bearish_if_hot" if "CPI" in ev["event"] else "volatile"
             })
-    # Guardar señal macro en global (se usará luego)
     return signal_macro
 
 # ==================== MÓDULO NOTICIAS ====================
 def analyze_sentiment_simple(text):
-    # Simulamos sentimiento: palabras positivas/negativas
     positive = ["rally", "surge", "gain", "up", "bull", "green", "approve", "good", "strong"]
     negative = ["crash", "drop", "down", "bear", "red", "reject", "fail", "emergency", "attack", "war"]
     words = text.lower().split()
@@ -220,18 +228,27 @@ def news_job():
     logging.info("Ejecutando news_job...")
     news = fetch_news()
     if not news:
-        return
+        return {"recent_count": 0, "latest_sentiment": 0, "has_emergency": False}
+
     signal_news = {"recent_count": 0, "latest_sentiment": 0, "has_emergency": False}
     for item in news:
-        # Enviar solo si sentimiento fuerte o palabra de alto impacto
         title_lower = item["title"].lower()
         is_high_impact = any(w in title_lower for w in HIGH_IMPACT_WORDS)
+        # Enviar solo si sentimiento fuerte o palabra de alto impacto
         if abs(item["sentiment"]) > SENTIMENT_THRESHOLD or is_high_impact:
-            msg = f"📰 *NOTICIA*\n📌 {item['title']}\n🔗 [Leer más]({item['link']})\n🏷️ Fuente: {item['source']}\n📊 Sentimiento: {'🟢 ALCISTA' if item['sentiment'] > 0 else '🔴 BAJISTA' if item['sentiment'] < 0 else '🔵 NEUTRAL'} ({item['sentiment']:.2f})"
+            emoji = "🟢 ALCISTA" if item["sentiment"] > 0 else "🔴 BAJISTA" if item["sentiment"] < 0 else "🔵 NEUTRAL"
+            msg = (
+                f"📰 *NOTICIA*\n"
+                f"📌 {item['title']}\n"
+                f"🔗 [Leer más]({item['link']})\n"
+                f"🏷️ Fuente: {item['source']}\n"
+                f"📊 Sentimiento: {emoji} ({item['sentiment']:.2f})"
+            )
             send_telegram(msg)
             save_sent_link(item["link"])
             time.sleep(1)
-        # Construir señal
+
+        # Actualizar señal
         signal_news["recent_count"] += 1
         signal_news["latest_sentiment"] = item["sentiment"]
         if "emergency" in title_lower or "attack" in title_lower:
@@ -240,7 +257,6 @@ def news_job():
 
 # ==================== GENERADOR DE SEÑAL GLOBAL ====================
 def update_signal():
-    # Ejecutar ambos módulos y combinar en un JSON
     macro_signal = macro_job() or {"has_high_impact": False, "events": []}
     news_signal = news_job() or {"recent_count": 0, "latest_sentiment": 0, "has_emergency": False}
 
@@ -269,14 +285,35 @@ def update_signal():
     save_json(SIGNAL_FILE, signal_data)
     logging.info(f"Señal actualizada: nivel {alert_level}")
 
+# ==================== SERVIDOR FLASK ====================
+app = Flask(__name__)
+
+@app.route('/signal')
+def get_signal():
+    try:
+        with open(SIGNAL_FILE, 'r') as f:
+            data = json.load(f)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": "No signal available", "detail": str(e)}), 404
+
+def run_flask():
+    app.run(host='0.0.0.0', port=5000)
+
 # ==================== INICIO ====================
 if __name__ == "__main__":
-    send_telegram("🤖 *Bot Fundamental Unificado iniciado*")
+    send_telegram("🤖 *Bot Fundamental Unificado con Flask iniciado*")
+    # Iniciar el servidor Flask en un hilo separado
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logging.info("Servidor Flask iniciado en puerto 5000")
+
+    # Programar la actualización de señal cada 30 minutos (o el intervalo que prefieras)
     scheduler = BackgroundScheduler()
-    # Ejecutar todo cada 30 minutos (macro + noticias + señal)
     scheduler.add_job(update_signal, 'interval', minutes=30)
     scheduler.start()
-    logging.info("Bot fundamental unificado corriendo.")
+    logging.info("Bot fundamental unificado corriendo. Scheduler activo.")
+
     try:
         while True:
             time.sleep(60)
