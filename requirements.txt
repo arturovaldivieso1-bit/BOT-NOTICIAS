@@ -3,3 +3,4 @@ feedparser
 apscheduler
 beautifulsoup4
 flask
+deep-translator
