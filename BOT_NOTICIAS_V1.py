@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.background import BackgroundScheduler
 from bs4 import BeautifulSoup
 from flask import Flask, jsonify
+from deep_translator import GoogleTranslator  # Traducción gratuita
 
 # ==================== CONFIGURACIÓN ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -18,14 +19,14 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 MACRO_INTERVAL_MINUTES = int(os.getenv("MACRO_INTERVAL_MINUTES", "60"))
 NEWS_INTERVAL_MINUTES = int(os.getenv("NEWS_INTERVAL_MINUTES", "30"))
 
-# Palabras clave para noticias
+# Palabras clave para noticias (en español e inglés, por si acaso)
 KEYWORDS = [
-    "bitcoin", "btc", "crypto", "ethereum", "fed", "rate", "inflation",
-    "sec", "etf", "jpmorgan", "blackrock", "attack", "war", "iran",
-    "fomc", "powell", "emergency"
+    "bitcoin", "btc", "cripto", "ethereum", "fed", "tasa", "inflación",
+    "sec", "etf", "jpmorgan", "blackrock", "ataque", "guerra", "irán",
+    "fomc", "powell", "emergencia", "interest rates", "rate hike"
 ]
 
-# Fuentes RSS
+# Fuentes RSS (noticias en inglés)
 RSS_FEEDS = [
     "https://www.reuters.com/rss/topNews",
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
@@ -38,8 +39,8 @@ SENT_MACRO_FILE = "sent_macro.json"
 SENT_NEWS_FILE = "sent_news.txt"
 
 # Umbrales
-SENTIMENT_THRESHOLD = 0.3
-HIGH_IMPACT_WORDS = ['emergency', 'attack', 'hike', 'sec', 'etf', 'fomc', 'powell']
+SENTIMENT_THRESHOLD = 0.2   # reducido para capturar más
+HIGH_IMPACT_WORDS = ['emergency', 'attack', 'hike', 'sec', 'etf', 'fomc', 'powell', 'ataque', 'emergencia', 'guerra']
 
 # ==================== FUNCIONES COMUNES ====================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -84,6 +85,18 @@ def load_sent_links():
         with open(SENT_NEWS_FILE, 'r') as f:
             return set(line.strip() for line in f)
     return set()
+
+# ==================== TRADUCCIÓN ====================
+translator = GoogleTranslator(source='en', target='es')
+
+def translate_title(title):
+    """Traduce un título del inglés al español."""
+    try:
+        # Limitar longitud para evitar problemas con la API gratuita
+        return translator.translate(title[:500])
+    except Exception as e:
+        logging.warning(f"Error traduciendo: {e}")
+        return title  # Devuelve el original si falla
 
 # ==================== MÓDULO MACRO ====================
 def parse_event_datetime(date_str, time_str):
@@ -182,14 +195,14 @@ def macro_job():
                 "event": ev["event"],
                 "time_minutes": round(minutes_left),
                 "impact": ev["impact"],
-                "bias": "bearish_if_hot" if "CPI" in ev["event"] else "volatile"
+                "bias": "bajista si sorprende al alza" if "CPI" in ev["event"] else "volátil"
             })
     return signal_macro
 
 # ==================== MÓDULO NOTICIAS ====================
 def analyze_sentiment_simple(text):
-    positive = ["rally", "surge", "gain", "up", "bull", "green", "approve", "good", "strong"]
-    negative = ["crash", "drop", "down", "bear", "red", "reject", "fail", "emergency", "attack", "war"]
+    positive = ["rally", "surge", "gain", "up", "bull", "green", "approve", "good", "strong", "alza", "sube", "verde", "aprueba"]
+    negative = ["crash", "drop", "down", "bear", "red", "reject", "fail", "emergency", "attack", "war", "caída", "baja", "rojo", "rechaza", "fracaso", "emergencia", "ataque", "guerra"]
     words = text.lower().split()
     score = 0
     for w in words:
@@ -210,10 +223,14 @@ def fetch_news():
                 link = entry.get('link', '')
                 if not link or link in sent_links:
                     continue
+                # Verificar relevancia por palabras clave en inglés (original)
                 if any(kw in title.lower() for kw in KEYWORDS):
                     sentiment = analyze_sentiment_simple(title)
+                    # Traducir título al español
+                    title_es = translate_title(title)
                     new_items.append({
-                        "title": title,
+                        "title_original": title,
+                        "title": title_es,
                         "link": link,
                         "source": feed_url,
                         "sentiment": sentiment
@@ -230,7 +247,7 @@ def news_job():
 
     signal_news = {"recent_count": 0, "latest_sentiment": 0, "has_emergency": False}
     for item in news:
-        title_lower = item["title"].lower()
+        title_lower = (item["title"] + " " + item["title_original"]).lower()
         is_high_impact = any(w in title_lower for w in HIGH_IMPACT_WORDS)
         if abs(item["sentiment"]) > SENTIMENT_THRESHOLD or is_high_impact:
             emoji = "🟢 ALCISTA" if item["sentiment"] > 0 else "🔴 BAJISTA" if item["sentiment"] < 0 else "🔵 NEUTRAL"
@@ -247,7 +264,7 @@ def news_job():
 
         signal_news["recent_count"] += 1
         signal_news["latest_sentiment"] = item["sentiment"]
-        if "emergency" in title_lower or "attack" in title_lower:
+        if "emergency" in title_lower or "attack" in title_lower or "emergencia" in title_lower or "ataque" in title_lower:
             signal_news["has_emergency"] = True
     return signal_news
 
@@ -303,7 +320,6 @@ def enviar_status_inicial():
     macro_events = fetch_macro_events()
     news_items = fetch_news()
 
-    # Construir mensaje
     lines = []
     lines.append("🤖 *Bot Fundamental iniciado*")
     lines.append(f"📅 Macro: revisión cada {MACRO_INTERVAL_MINUTES} min")
@@ -312,7 +328,7 @@ def enviar_status_inicial():
 
     if macro_events:
         lines.append("*Próximos eventos macro:*")
-        for ev in macro_events[:5]:  # mostrar hasta 5
+        for ev in macro_events[:5]:
             lines.append(f"• {ev['event']} ({ev['impact']}) - {ev['datetime'].strftime('%d/%m %H:%M UTC')}")
         if len(macro_events) > 5:
             lines.append(f"... y {len(macro_events)-5} más.")
@@ -333,15 +349,12 @@ def enviar_status_inicial():
 
 # ==================== INICIO ====================
 if __name__ == "__main__":
-    # Enviar mensaje de inicio con status actual
     enviar_status_inicial()
 
-    # Iniciar servidor Flask
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     logging.info("Servidor Flask iniciado en puerto 5000")
 
-    # Programar tareas
     scheduler = BackgroundScheduler()
     scheduler.add_job(update_signal, 'interval', minutes=30)
     scheduler.start()
