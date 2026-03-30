@@ -5,3 +5,4 @@ beautifulsoup4
 flask
 deep-translator
 vaderSentiment
+python-telegram-bot
