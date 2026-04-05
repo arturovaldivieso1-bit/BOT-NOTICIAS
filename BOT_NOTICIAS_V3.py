@@ -547,13 +547,14 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
-def run_telegram_bot():
+def build_telegram_app():
+    """Construye y devuelve la app de Telegram (sin iniciar polling)."""
     if not TELEGRAM_BOT_TOKEN:
         logging.warning("No se iniciará bot de comandos: falta TELEGRAM_BOT_TOKEN")
-        return
+        return None
     tg_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     tg_app.add_handler(CommandHandler("stats", stats_command))
-    tg_app.run_polling()
+    return tg_app
 
 # ==================== REPORTE INICIAL ====================
 def enviar_status_inicial():
@@ -618,19 +619,30 @@ def enviar_status_inicial():
 
 # ==================== INICIO ====================
 if __name__ == "__main__":
+    # Reporte inicial (síncrono, antes de arrancar todo)
     enviar_status_inicial()
 
-    threading.Thread(target=run_flask,        daemon=True).start()
-    threading.Thread(target=run_telegram_bot, daemon=True).start()
-    logging.info("Flask en :5000 | Bot Telegram iniciado")
+    # Flask en hilo secundario (no necesita main thread)
+    threading.Thread(target=run_flask, daemon=True).start()
+    logging.info("Flask en :5000")
 
+    # Scheduler en hilo secundario
     scheduler = BackgroundScheduler()
     scheduler.add_job(update_signal, 'interval', minutes=30)
     scheduler.start()
     logging.info("Scheduler activo — actualización cada 30 min")
 
-    try:
-        while True:
-            time.sleep(60)
-    except KeyboardInterrupt:
-        scheduler.shutdown()
+    # Telegram DEBE correr en el main thread (asyncio + señales del SO)
+    tg_app = build_telegram_app()
+    if tg_app:
+        logging.info("Bot Telegram iniciado en main thread")
+        tg_app.run_polling()          # bloquea aquí — es correcto
+    else:
+        # Si no hay token, mantener el proceso vivo igual
+        try:
+            while True:
+                time.sleep(60)
+        except KeyboardInterrupt:
+            pass
+
+    scheduler.shutdown()
