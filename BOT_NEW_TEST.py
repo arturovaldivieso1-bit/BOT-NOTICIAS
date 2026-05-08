@@ -25,12 +25,11 @@ if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
 MACRO_INTERVAL_MINUTES = int(os.getenv("MACRO_INTERVAL_MINUTES", "60"))
 NEWS_INTERVAL_MINUTES  = int(os.getenv("NEWS_INTERVAL_MINUTES",  "30"))
 
-# ── CONTROL DE ALERTAS DIARIAS ──────────────────────────────────────────────
-MAX_ALERTS_PER_DAY = 3          # techo duro: máximo 3 alertas de noticias por día
-alerts_today: list[datetime] = []   # timestamps de alertas enviadas hoy
+# ── CONTROL DE ALERTAS DIARIAS (mejorado) ──────────────────────────────────
+MAX_ALERTS_PER_DAY = 6          # antes 3, ahora 6 para cubrir alta volatilidad
+alerts_today: list[datetime] = []
 
 def _purge_old_alerts():
-    """Elimina alertas con más de 24 h de antigüedad."""
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
     global alerts_today
     alerts_today = [t for t in alerts_today if t > cutoff]
@@ -42,23 +41,31 @@ def can_send_alert() -> bool:
 def register_alert():
     alerts_today.append(datetime.now(timezone.utc))
 
-# ── KEYWORDS DE ALTO IMPACTO REAL ───────────────────────────────────────────
-# Solo macro + riesgo sistémico. Eliminado: bitcoin, btc, crypto, ethereum, etc.
+# ── KEYWORDS DE ALTO IMPACTO (ampliado) ─────────────────────────────────────
 KEYWORDS = [
-    # Macro / bancos centrales
+    # Macro / bancos centrales (ampliado)
     "fed", "federal reserve", "fomc", "powell", "interest rate", "rate hike",
     "rate cut", "inflation", "cpi", "pce", "gdp", "recession", "nonfarm",
     "payroll", "unemployment", "ecb", "lagarde", "boj", "bank of japan",
-    # Riesgo sistémico / geopolítico
+    "taper", "quantitative easing", "quantitative tightening", "balance sheet",
+    "dot plot", "pivot", "initial claims", "durable goods", "ism", "pmi",
+    "dollar", "usd", "yield curve", "bond market",
+    # Riesgo sistémico / geopolítico (incluye Trump)
     "attack", "war", "crisis", "emergency", "sanctions", "default",
     "collapse", "invasion", "missile", "nuclear", "ataque", "guerra",
     "emergencia", "colapso",
-    # Regulación de alto impacto (solo las que mueven mercado)
+    "trump", "biden", "putin", "xi", "zelensky",
+    "tariff", "trade war", "debt ceiling", "shutdown", "geopolitical",
+    # Commodities / energía
+    "opec", "oil", "crude", "energy crisis", "gas",
+    # Regulación de alto impacto
     "sec enforcement", "sec lawsuit", "ban", "blackrock etf", "etf approved",
     "etf rejected",
+    # Otros de alto impacto financiero
+    "credit suisse", "silicon valley bank", "contagion", "svb",
 ]
 
-# Pesos: solo palabras que tienen impacto real y documentado en precio
+# Pesos actualizados con nuevas keywords
 KEYWORD_WEIGHTS: dict[str, float] = {
     "fomc":             2.0,
     "federal reserve":  2.0,
@@ -82,15 +89,49 @@ KEYWORD_WEIGHTS: dict[str, float] = {
     "blackrock etf":    1.8,
     "sec enforcement":  1.8,
     "sec lawsuit":      1.8,
+    "trump":            1.9,
+    "biden":            1.4,
+    "putin":            1.6,
+    "xi":               1.5,
+    "zelensky":         1.5,
+    "tariff":           1.7,
+    "trade war":        1.8,
+    "debt ceiling":     1.8,
+    "shutdown":         1.6,
+    "geopolitical":     1.6,
+    "opec":             1.6,
+    "oil":              1.5,
+    "crude":            1.4,
+    "energy crisis":    1.8,
+    "gas":              1.4,
+    "taper":            1.7,
+    "quantitative easing": 1.6,
+    "quantitative tightening": 1.6,
+    "balance sheet":    1.5,
+    "dot plot":         1.6,
+    "pivot":            1.5,
+    "initial claims":   1.5,
+    "durable goods":    1.4,
+    "ism":              1.4,
+    "pmi":              1.4,
+    "yield curve":      1.6,
+    "bond market":      1.5,
+    "dollar":           1.4,
+    "usd":              1.3,
+    "credit suisse":    1.9,
+    "silicon valley bank": 1.9,
+    "contagion":        1.8,
+    "svb":              1.8,
 }
 
-# ── FUENTES RSS ──────────────────────────────────────────────────────────────
-# Eliminadas: CryptoPanic (mucho ruido retail) y CoinDesk (baja señal/ruido).
-# Mantenidas solo las de mayor rigor periodístico para macro y riesgo.
+# ── FUENTES RSS (ampliado) ─────────────────────────────────────────────────
 RSS_FEEDS = {
-    "https://www.reuters.com/rss/topNews":    {"level": 1, "base_weight": 2.0},
-    "https://www.forexlive.com/feed/":        {"level": 1, "base_weight": 1.8},
-    "https://www.theblock.co/rss":            {"level": 2, "base_weight": 1.2},
+    "https://www.reuters.com/rss/topNews":              {"level": 1, "base_weight": 2.0},
+    "https://www.forexlive.com/feed/":                  {"level": 1, "base_weight": 1.8},
+    "https://www.theblock.co/rss":                      {"level": 2, "base_weight": 1.2},
+    "https://www.cnbc.com/id/100003114/device/rss/rss.html": {"level": 2, "base_weight": 1.5},  # CNBC Economy
+    "https://feeds.marketwatch.com/marketwatch/topstories":  {"level": 2, "base_weight": 1.4},  # MarketWatch
+    "https://www.zerohedge.com/fullrss2.xml":           {"level": 2, "base_weight": 1.6},       # ZeroHedge
 }
 
 # ── ARCHIVOS ─────────────────────────────────────────────────────────────────
@@ -98,22 +139,20 @@ SIGNAL_FILE      = "signal.json"
 SENT_MACRO_FILE  = "sent_macro.json"
 SENT_NEWS_FILE   = "sent_news.txt"
 
-# ── UMBRALES ─────────────────────────────────────────────────────────────────
-# Antes: 0.2 / 0.4  →  Ahora: 0.65 / 0.85
-# El weighted_sentiment debe ser alto Y venir de una keyword de peso ≥ 1.6
-SENTIMENT_THRESHOLD_LEVEL1 = 0.65
-SENTIMENT_THRESHOLD_LEVEL2 = 0.85
+# ── UMBRALES (suavizados) ───────────────────────────────────────────────────
+SENTIMENT_THRESHOLD_LEVEL1 = 0.30   # antes 0.65
+SENTIMENT_THRESHOLD_LEVEL2 = 0.50   # antes 0.85
 
-# Un artículo solo pasa si su keyword más pesada supera este umbral
-MIN_KEYWORD_WEIGHT_TO_QUALIFY = 1.6
+# Un artículo solo pasa si su keyword más pesada supera este umbral (rebajado)
+MIN_KEYWORD_WEIGHT_TO_QUALIFY = 1.2   # antes 1.6
 
-# Cooldown por keyword: 6 h (antes 2 h) — evita duplicados del mismo tema
-COOLDOWN_MINUTES = 360
+# Cooldown por keyword reducido a 2 horas (antes 6h)
+COOLDOWN_MINUTES = 120
 
-# Palabras que elevan prioridad pero siguen necesitando sentimiento mínimo
+# Palabras de emergencia que elevan prioridad y relajan filtro de sentimiento
 HIGH_IMPACT_WORDS = [
     "emergency", "attack", "invasion", "nuclear", "default", "collapse",
-    "emergencia", "ataque", "invasion", "colapso",
+    "emergencia", "ataque", "invasion", "colapso", "trump", "war",
 ]
 
 WEIGHTED_INTENSITY_WINDOW_HOURS = 6
@@ -190,7 +229,10 @@ def parse_event_datetime(date_str, time_str):
     return None
 
 def fetch_macro_events():
-    """Eventos de alto/medio impacto en las próximas 24 horas."""
+    """
+    IMPORTANTE: Este scraping es frágil. Investing.com carga contenido dinámico con JS.
+    Si no encuentra eventos, considera usar una API de calendario económico.
+    """
     url     = "https://www.investing.com/economic-calendar/"
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
@@ -199,6 +241,7 @@ def fetch_macro_events():
         table = soup.find('table', {'id': 'economicCalendarData'}) or \
                 soup.find('table', class_='ecoCal')
         if not table:
+            logging.warning("Tabla de calendario no encontrada (probable carga dinámica).")
             return []
 
         events  = []
@@ -237,7 +280,7 @@ def fetch_macro_events():
         return []
 
 def fetch_macro_events_week():
-    """Eventos de ALTO impacto en los próximos 7 días (para reporte semanal)."""
+    """Eventos de ALTO impacto en los próximos 7 días."""
     url     = "https://www.investing.com/economic-calendar/"
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
@@ -268,7 +311,7 @@ def fetch_macro_events_week():
                 impact = "High"
             elif impact_cell.find('span', class_='medium'):
                 impact = "Medium"
-            if impact != "High":  # solo alto impacto en el parte semanal
+            if impact != "High":
                 continue
             events.append({
                 "datetime": event_dt,
@@ -320,7 +363,7 @@ def macro_job():
             })
     return signal_macro
 
-# ==================== MÓDULO NOTICIAS ====================
+# ==================== MÓDULO NOTICIAS (con logs de depuración) ===============
 recent_news: list[dict]          = []
 last_alert_by_keyword: dict      = {}
 
@@ -330,11 +373,6 @@ def clean_old_news():
     recent_news = [n for n in recent_news if n["timestamp"] > cutoff]
 
 def compute_keyword_boost(title: str) -> tuple[float, float]:
-    """
-    Devuelve (boost_acumulado, peso_max_keyword).
-    boost: multiplicador de sentimiento.
-    peso_max: la keyword individual más pesada detectada.
-    """
     title_lower = title.lower()
     boost    = 1.0
     max_kw_w = 0.0
@@ -345,11 +383,11 @@ def compute_keyword_boost(title: str) -> tuple[float, float]:
     return boost, max_kw_w
 
 def _keyword_in_cooldown(title_lower: str) -> bool:
-    """True si alguna keyword fuerte del título está dentro del cooldown."""
     for kw in KEYWORD_WEIGHTS:
         if kw in title_lower and kw in last_alert_by_keyword:
             elapsed = (datetime.now(timezone.utc) - last_alert_by_keyword[kw]).total_seconds() / 60
             if elapsed < COOLDOWN_MINUTES:
+                logging.debug(f"Cooldown activo para '{kw}' ({elapsed:.0f} min de {COOLDOWN_MINUTES})")
                 return True
     return False
 
@@ -361,7 +399,7 @@ def fetch_news():
         base_weight = feed_info["base_weight"]
         try:
             feed = feedparser.parse(feed_url)
-            for entry in feed.entries[:15]:
+            for entry in feed.entries[:30]:   # antes solo 15
                 title = entry.get('title', '')
                 link  = entry.get('link', '')
                 if not link or link in sent_links:
@@ -410,6 +448,10 @@ def news_job():
         "top_keywords":              [],
     }
     all_keywords = []
+    discarded_weight = 0
+    discarded_sentiment = 0
+    discarded_cooldown = 0
+    discarded_daily_limit = 0
 
     for item in news:
         recent_news.append({
@@ -422,33 +464,35 @@ def news_job():
         title_lower = (item["title"] + " " + item["title_original"]).lower()
         is_high_impact = any(w in title_lower for w in HIGH_IMPACT_WORDS)
 
-        # ── FILTRO 1: la keyword más pesada debe superar el mínimo ──────────
+        # FILTRO 1: peso mínimo de keyword
         if item["max_kw_weight"] < MIN_KEYWORD_WEIGHT_TO_QUALIFY and not is_high_impact:
-            continue  # noticia descartada — no tiene keywords de suficiente peso
+            discarded_weight += 1
+            logging.debug(f"Descartada (peso kw {item['max_kw_weight']:.2f} < {MIN_KEYWORD_WEIGHT_TO_QUALIFY}): {item['title_original'][:80]}")
+            continue
 
-        # ── FILTRO 2: umbral de sentimiento ponderado ────────────────────────
+        # FILTRO 2: umbral de sentimiento
         threshold = SENTIMENT_THRESHOLD_LEVEL1 if item["level"] == 1 else SENTIMENT_THRESHOLD_LEVEL2
         passes_sentiment = abs(item["weighted_sentiment"]) >= threshold
-
-        # Las HIGH_IMPACT_WORDS sí pasan, pero solo si el sentimiento no es
-        # completamente neutro (evita artículos de archivo o contexto vacío)
         if is_high_impact:
             passes_sentiment = passes_sentiment or abs(item["sentiment"]) >= 0.15
 
         if not passes_sentiment:
+            discarded_sentiment += 1
+            logging.debug(f"Descartada (w_sent {item['weighted_sentiment']:.2f} < {threshold}, sent_raw {item['sentiment']:.2f}): {item['title_original'][:80]}")
             continue
 
-        # ── FILTRO 3: cooldown por keyword ───────────────────────────────────
+        # FILTRO 3: cooldown por keyword
         if _keyword_in_cooldown(title_lower):
-            logging.info(f"Cooldown activo para: {item['title_original'][:60]}")
+            discarded_cooldown += 1
             continue
 
-        # ── FILTRO 4: techo diario de alertas ────────────────────────────────
+        # FILTRO 4: techo diario
         if not can_send_alert():
-            logging.info("Techo diario de alertas alcanzado. Noticia descartada.")
+            discarded_daily_limit += 1
+            logging.info("Techo diario de alertas alcanzado.")
             continue
 
-        # ── ENVIAR ────────────────────────────────────────────────────────────
+        # ── ENVIAR ──────────────────────────────────────────────────────────
         emoji = "🟢 ALCISTA" if item["sentiment"] > 0 else \
                 "🔴 BAJISTA" if item["sentiment"] < 0 else "🔵 NEUTRAL"
         msg = (
@@ -476,6 +520,11 @@ def news_job():
         if any(w in title_lower for w in ["emergency", "attack", "emergencia", "ataque"]):
             signal_news["has_emergency"] = True
         all_keywords.extend(item["keywords"])
+
+    # Resumen de descartes (solo en log)
+    total_news = len(news)
+    total_passed = signal_news["recent_count"]
+    logging.info(f"Noticias descartadas: peso_kw={discarded_weight}, sent={discarded_sentiment}, cooldown={discarded_cooldown}, diario={discarded_daily_limit}. Pasaron {total_passed} de {total_news}.")
 
     if all_keywords:
         signal_news["top_keywords"] = [kw for kw, _ in Counter(all_keywords).most_common(5)]
@@ -544,7 +593,7 @@ def update_signal():
 
 # ==================== REPORTE SEMANAL ====================
 def weekly_report_job():
-    """Envía todos los domingos a las 22:00 UTC el parte semanal."""
+    """Todos los domingos a las 22:00 UTC."""
     logging.info("Generando reporte semanal...")
     try:
         with open(SIGNAL_FILE) as f:
@@ -561,7 +610,6 @@ def weekly_report_job():
     news_signal = signal.get("news", {})
     kws = ", ".join(news_signal.get("top_keywords", [])) or "ninguna"
 
-    # Eventos macro de la semana (alto impacto)
     weekly_events = fetch_macro_events_week()
     if weekly_events:
         events_lines = []
@@ -570,7 +618,7 @@ def weekly_report_job():
             events_lines.append(f"• {dt_str} - {ev['event']} ({ev['country']})")
         events_text = "\n".join(events_lines)
     else:
-        events_text = "No hay eventos de alto impacto previstos."
+        events_text = "No se detectaron eventos de alto impacto (revisar scraping)."
 
     msg = (
         f"📅 *Parte semanal del Bot Fundamental*\n\n"
@@ -660,17 +708,18 @@ def enviar_status_inicial():
     avg_w_sent = sum(n["weighted_sentiment"] for n in news_items) / (len(news_items) or 1)
 
     lines = [
-        "🤖 *Bot Fundamental — Estado inicial*", "",
+        "🤖 *Bot Fundamental — Estado inicial (configuración mejorada)*", "",
         f"📅 Macro: cada {MACRO_INTERVAL_MINUTES} min | 📰 Noticias: cada {NEWS_INTERVAL_MINUTES} min",
         f"🔔 Techo diario de alertas: {MAX_ALERTS_PER_DAY}", "",
         f"📈 Score: `{score}` | Estado: *{state}*",
         "   └─ ⚡ Volatilidad inminente" if vol_spike else "",
         "   └─ 🚨 Modo pánico"           if panic     else "", "",
-        "*Umbrales activos:*",
+        "*Umbrales activos (suavizados):*",
         f"   • Nivel 1 (Reuters/ForexLive): weighted_sentiment ≥ {SENTIMENT_THRESHOLD_LEVEL1}",
-        f"   • Nivel 2 (TheBlock):          weighted_sentiment ≥ {SENTIMENT_THRESHOLD_LEVEL2}",
-        f"   • Keyword mínima requerida:    peso ≥ {MIN_KEYWORD_WEIGHT_TO_QUALIFY}",
+        f"   • Nivel 2 (TheBlock/CNBC/...):  weighted_sentiment ≥ {SENTIMENT_THRESHOLD_LEVEL2}",
+        f"   • Keyword mínima para calificar: peso ≥ {MIN_KEYWORD_WEIGHT_TO_QUALIFY}",
         f"   • Cooldown por keyword:        {COOLDOWN_MINUTES // 60} h", "",
+        "*Palabras de emergencia (bypass parcial):* " + ", ".join(HIGH_IMPACT_WORDS[:8]) + "...", "",
     ]
 
     if macro_events:
@@ -680,14 +729,14 @@ def enviar_status_inicial():
         if len(macro_events) > 5:
             lines.append(f"   ... y {len(macro_events)-5} más.")
     else:
-        lines.append("*📆 No hay eventos macro relevantes en las próximas 24 h.*")
+        lines.append("*📆 No se detectaron eventos macro (puede fallar el scraping).*")
 
     lines.append("")
     if news_items:
         qualified = [n for n in news_items if n["max_kw_weight"] >= MIN_KEYWORD_WEIGHT_TO_QUALIFY]
         lines += [
             f"*📰 Noticias totales detectadas:* {len(news_items)}",
-            f"   Califican para alerta: {len(qualified)}",
+            f"   Califican para alerta (peso kw): {len(qualified)}",
             f"   Sentimiento ponderado promedio: {avg_w_sent:.2f}",
         ]
         if kw_counts:
@@ -713,7 +762,6 @@ if __name__ == "__main__":
 
     scheduler = BackgroundScheduler()
     scheduler.add_job(update_signal, 'interval', minutes=30)
-    # NUEVO: reporte semanal cada domingo a las 22:00 UTC
     scheduler.add_job(weekly_report_job, 'cron', day_of_week='sun', hour=22, minute=0)
     scheduler.start()
     logging.info("Scheduler activo — actualización cada 30 min + reporte semanal domingos 22:00 UTC")
